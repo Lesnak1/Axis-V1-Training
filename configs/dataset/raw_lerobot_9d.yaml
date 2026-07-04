@@ -1,0 +1,20 @@
+dataset:
+  name: axis_raw_9d
+  path: ${AXIS_TASK_DATASET:-datasets/axis_clean/task_0000_train}
+  format: lerobot_v3
+  fps: 30
+
+  image_keys:
+    front: observation.images.third_person
+    wrist: observation.images.wrist
+
+  state_key: observation.state
+  action_key: action
+  language_key: task
+
+  expected_action_dim: 9
+  expected_state_dim: 9
+
+  source:
+    dynamics: mujoco_collection
+    rendering: isaaclab

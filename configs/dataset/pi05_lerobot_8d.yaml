@@ -1,0 +1,27 @@
+dataset:
+  name: axis_pi05_8d
+  path: ${AXIS_PI05_DATASET:-datasets/axis_pi05_8d}
+  format: lerobot_v3
+  fps: 30
+
+  image_keys:
+    front: observation.images.third_person
+    wrist: observation.images.wrist
+
+  state_key: observation.state
+  action_key: action
+  raw_action_key: action.raw_9d
+  language_key: task
+
+  expected_action_dim: 8
+  expected_state_dim: 9
+  split_manifest: ${AXIS_PI05_DATASET:-datasets/axis_pi05_8d}/meta/split_manifest.json
+
+action_spec:
+  canonical_dim: 8
+  arm_dim: 7
+  gripper_dim: 1
+  arm_action_type: joint_position
+  gripper_convention:
+    open: 0.0
+    closed: 1.0

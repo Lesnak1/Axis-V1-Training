@@ -1,0 +1,774 @@
+diff --git a/scripts/compute_norm_stats.py b/scripts/compute_norm_stats.py
+index c8aef87..0fdb6ad 100644
+--- a/scripts/compute_norm_stats.py
++++ b/scripts/compute_norm_stats.py
+@@ -90,23 +90,30 @@ def main(config_name: str, max_frames: int | None = None):
+     config = _config.get_config(config_name)
+     data_config = config.data.create(config.assets_dirs, config.model)
+ 
+-    if data_config.rlds_data_dir is not None:
+-        data_loader, num_batches = create_rlds_dataloader(
+-            data_config, config.model.action_horizon, config.batch_size, max_frames
++    if _data_loader.axis_clean_local_root(data_config) is not None:
++        norm_stats = _data_loader.compute_axis_clean_droid_norm_stats(
++            data_config,
++            config.model.action_horizon,
++            max_frames=max_frames,
+         )
+     else:
+-        data_loader, num_batches = create_torch_dataloader(
+-            data_config, config.model.action_horizon, config.batch_size, config.model, config.num_workers, max_frames
+-        )
+-
+-    keys = ["state", "actions"]
+-    stats = {key: normalize.RunningStats() for key in keys}
+-
+-    for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
+-        for key in keys:
+-            stats[key].update(np.asarray(batch[key]))
+-
+-    norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
++        if data_config.rlds_data_dir is not None:
++            data_loader, num_batches = create_rlds_dataloader(
++                data_config, config.model.action_horizon, config.batch_size, max_frames
++            )
++        else:
++            data_loader, num_batches = create_torch_dataloader(
++                data_config, config.model.action_horizon, config.batch_size, config.model, config.num_workers, max_frames
++            )
++
++        keys = ["state", "actions"]
++        stats = {key: normalize.RunningStats() for key in keys}
++
++        for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
++            for key in keys:
++                stats[key].update(np.asarray(batch[key]))
++
++        norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
+ 
+     output_path = config.assets_dirs / data_config.repo_id
+     print(f"Writing stats to: {output_path}")
+diff --git a/src/openpi/training/config.py b/src/openpi/training/config.py
+index 4ca47e1..6bb01f3 100644
+--- a/src/openpi/training/config.py
++++ b/src/openpi/training/config.py
+@@ -5,6 +5,7 @@ from collections.abc import Sequence
+ import dataclasses
+ import difflib
+ import logging
++import os
+ import pathlib
+ from typing import Any, Literal, Protocol, TypeAlias
+ 
+@@ -34,6 +35,16 @@ ModelType: TypeAlias = _model.ModelType
+ Filter: TypeAlias = nnx.filterlib.Filter
+ 
+ 
++def _freeze_pi05_lora(path: nnx.filterlib.PathParts, _param: Any) -> bool:
++    """Freeze vision backbones and non-LoRA language weights for Pi0.5 LoRA fine-tuning."""
++    param_path = "/".join(str(part) for part in path)
++    if param_path.startswith("PaliGemma/img/"):
++        return True
++    if param_path.startswith("PaliGemma/llm/"):
++        return "lora" not in param_path
++    return False
++
++
+ @dataclasses.dataclass(frozen=True)
+ class AssetsConfig:
+     """Determines the location of assets (e.g., norm stats) that will be used to set up the data pipeline.
+@@ -92,6 +103,16 @@ class DataConfig:
+ 
+     # Only used for RLDS data loader (ie currently only used for DROID).
+     rlds_data_dir: str | None = None
++
++    # Local AXIS-format LeRobot root. This root contains task_*_isaac_state_train
++    # LeRobot-v3 datasets with 9D [two gripper fingers, seven arm joints]
++    # state/action arrays and front/wrist videos.
++    axis_clean_root: str | None = None
++    axis_clean_velocity_scale: float = 1.0 / 15.0
++    axis_clean_downsample_ratio: int = 2
++    axis_clean_gripper_open_q: tuple[float, ...] = (0.04, 0.04)
++    axis_clean_gripper_close_q: tuple[float, ...] = (0.0, 0.0)
++    axis_clean_clip_velocity_actions: bool = True
+     # Action space for DROID dataset.
+     action_space: droid_rlds_dataset.DroidActionSpace | None = None
+     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
+@@ -355,6 +376,64 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
+         )
+ 
+ 
++@dataclasses.dataclass(frozen=True)
++class LeRobotAxisCleanDroidDataConfig(DataConfigFactory):
++    """Local AXIS-format LeRobot-v3 data adapted to the Pi0.5-DROID schema.
++
++    The source export is a directory of task_*_isaac_state_train LeRobot-v3
++    datasets with 30 Hz RoboVerse joint qpos state/action:
++        [left_gripper_qpos, right_gripper_qpos, arm_joint_1, ..., arm_joint_7]
++
++    The local data loader converts this online to OpenPI's DROID interface:
++        observation/joint_position + observation/gripper_position + 8D DROID-style actions.
++    """
++
++    repo_id: str = "local/axis_clean"
++    clean_root: str = os.environ.get("AXIS_CLEAN_ROOT", "./datasets/axis_clean")
++    action_sequence_keys: Sequence[str] = ("actions",)
++    velocity_scale: float = float(os.environ.get("AXIS_CLEAN_DROID_VELOCITY_SCALE", 1.0 / 15.0))
++    downsample_ratio: int = int(os.environ.get("AXIS_CLEAN_DROID_DOWNSAMPLE_RATIO", 2))
++    gripper_open_q: tuple[float, ...] = (0.04, 0.04)
++    gripper_close_q: tuple[float, ...] = (0.0, 0.0)
++    clip_velocity_actions: bool = True
++
++    @override
++    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
++        repack_transform = _transforms.Group(
++            inputs=[
++                _transforms.RepackTransform(
++                    {
++                        "observation/exterior_image_1_left": "observation.exterior_image_1_left",
++                        "observation/wrist_image_left": "observation.wrist_image_left",
++                        "observation/joint_position": "observation.joint_position",
++                        "observation/gripper_position": "observation.gripper_position",
++                        "actions": "actions",
++                        "prompt": "prompt",
++                    }
++                )
++            ]
++        )
++        data_transforms = _transforms.Group(
++            inputs=[droid_policy.DroidInputs(model_type=model_config.model_type)],
++            outputs=[droid_policy.DroidOutputs()],
++        )
++        model_transforms = ModelTransformFactory()(model_config)
++
++        return dataclasses.replace(
++            self.create_base_config(assets_dirs, model_config),
++            repack_transforms=repack_transform,
++            data_transforms=data_transforms,
++            model_transforms=model_transforms,
++            action_sequence_keys=self.action_sequence_keys,
++            axis_clean_root=str(pathlib.Path(self.clean_root).expanduser().resolve()),
++            axis_clean_velocity_scale=self.velocity_scale,
++            axis_clean_downsample_ratio=self.downsample_ratio,
++            axis_clean_gripper_open_q=self.gripper_open_q,
++            axis_clean_gripper_close_q=self.gripper_close_q,
++            axis_clean_clip_velocity_actions=self.clip_velocity_actions,
++        )
++
++
+ @dataclasses.dataclass(frozen=True)
+ class RLDSDroidDataConfig(DataConfigFactory):
+     """
+@@ -761,6 +840,113 @@ _CONFIGS = [
+         pytorch_weight_path="/path/to/your/pytorch_weight_path",
+         num_train_steps=30_000,
+     ),
++    TrainConfig(
++        # Low-memory Pi0.5 LoRA fine-tuning on LIBERO LeRobot data.
++        name="pi05_libero_lora",
++        model=pi0_config.Pi0Config(
++            pi05=True,
++            action_horizon=10,
++            discrete_state_input=False,
++            paligemma_variant="gemma_2b_lora",
++            action_expert_variant="gemma_300m_lora",
++        ),
++        data=LeRobotLiberoDataConfig(
++            repo_id="physical-intelligence/libero",
++            assets=AssetsConfig(
++                assets_dir=os.environ.get("LIBERO_PI05_ASSETS", "gs://openpi-assets/checkpoints/pi05_libero/assets"),
++                asset_id="physical-intelligence/libero",
++            ),
++            base_config=DataConfig(prompt_from_task=True),
++            extra_delta_transform=False,
++        ),
++        weight_loader=weight_loaders.CheckpointWeightLoader(
++            os.environ.get("LIBERO_PI05_LORA_INIT_PARAMS", "gs://openpi-assets/checkpoints/pi05_base/params")
++        ),
++        lr_schedule=_optimizer.CosineDecaySchedule(
++            warmup_steps=1_000,
++            peak_lr=5e-5,
++            decay_steps=100_000,
++            decay_lr=5e-5,
++        ),
++        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
++        num_train_steps=20_000,
++        batch_size=8,
++        num_workers=0,
++        save_interval=1_000,
++        keep_period=5_000,
++        freeze_filter=_freeze_pi05_lora,
++        ema_decay=None,
++        wandb_enabled=False,
++        fsdp_devices=1,
++    ),
++    TrainConfig(
++        # Full fine-tuning / continued pretraining on AXIS-format LeRobot data.
++        # Set AXIS_PI05_FULL_INIT_PARAMS to continue from a custom CPT checkpoint;
++        # otherwise this starts from the official Pi0.5-DROID checkpoint.
++        name="pi05_axis_clean_local_droid_full",
++        model=pi0_config.Pi0Config(pi05=True, action_horizon=15),
++        data=LeRobotAxisCleanDroidDataConfig(
++            assets=AssetsConfig(
++                assets_dir=os.environ.get("AXIS_PI05_DROID_ASSETS", "gs://openpi-assets/checkpoints/pi05_droid/assets"),
++                asset_id="droid",
++            ),
++            base_config=DataConfig(prompt_from_task=False),
++        ),
++        weight_loader=weight_loaders.CheckpointWeightLoader(
++            os.environ.get("AXIS_PI05_FULL_INIT_PARAMS", "gs://openpi-assets/checkpoints/pi05_droid/params")
++        ),
++        lr_schedule=_optimizer.CosineDecaySchedule(
++            warmup_steps=1_000,
++            peak_lr=5e-5,
++            decay_steps=100_000,
++            decay_lr=5e-5,
++        ),
++        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
++        num_train_steps=20_000,
++        batch_size=8,
++        num_workers=0,
++        save_interval=1_000,
++        keep_period=5_000,
++        wandb_enabled=False,
++        fsdp_devices=4,
++    ),
++    TrainConfig(
++        # LoRA fine-tuning on AXIS-format LeRobot data. Set AXIS_PI05_LORA_INIT_PARAMS
++        # to start from a CPT checkpoint; otherwise this starts from Pi0.5-DROID.
++        name="pi05_axis_clean_local_droid_lora",
++        model=pi0_config.Pi0Config(
++            pi05=True,
++            action_horizon=15,
++            paligemma_variant="gemma_2b_lora",
++            action_expert_variant="gemma_300m_lora",
++        ),
++        data=LeRobotAxisCleanDroidDataConfig(
++            assets=AssetsConfig(
++                assets_dir=os.environ.get("AXIS_PI05_DROID_ASSETS", "gs://openpi-assets/checkpoints/pi05_droid/assets"),
++                asset_id="droid",
++            ),
++            base_config=DataConfig(prompt_from_task=False),
++        ),
++        weight_loader=weight_loaders.CheckpointWeightLoader(
++            os.environ.get("AXIS_PI05_LORA_INIT_PARAMS", "gs://openpi-assets/checkpoints/pi05_droid/params")
++        ),
++        lr_schedule=_optimizer.CosineDecaySchedule(
++            warmup_steps=1_000,
++            peak_lr=5e-5,
++            decay_steps=100_000,
++            decay_lr=5e-5,
++        ),
++        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
++        num_train_steps=20_000,
++        batch_size=8,
++        num_workers=0,
++        save_interval=1_000,
++        keep_period=5_000,
++        freeze_filter=_freeze_pi05_lora,
++        ema_decay=None,
++        wandb_enabled=False,
++        fsdp_devices=4,
++    ),
+     #
+     # Fine-tuning Aloha configs.
+     #
+diff --git a/src/openpi/training/data_loader.py b/src/openpi/training/data_loader.py
+index e2ee7dd..bfb938d 100644
+--- a/src/openpi/training/data_loader.py
++++ b/src/openpi/training/data_loader.py
+@@ -1,7 +1,12 @@
++import bisect
++import collections
+ from collections.abc import Iterator, Sequence
++import json
+ import logging
+ import multiprocessing
+ import os
++import pathlib
++import re
+ import typing
+ from typing import Literal, Protocol, SupportsIndex, TypeVar
+ 
+@@ -9,9 +14,11 @@ import jax
+ import jax.numpy as jnp
+ import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+ import numpy as np
++import pandas as pd
+ import torch
+ 
+ import openpi.models.model as _model
++import openpi.shared.normalize as _normalize
+ import openpi.training.config as _config
+ from openpi.training.droid_rlds_dataset import DroidRldsDataset
+ import openpi.transforms as _transforms
+@@ -127,6 +134,452 @@ class FakeDataset(Dataset):
+         return self._num_samples
+ 
+ 
++_AXIS_CLEAN_LOCAL_PREFIX = "axis-clean-local:"
++
++
++def axis_clean_local_root(data_config: _config.DataConfig) -> pathlib.Path | None:
++    root = getattr(data_config, "axis_clean_root", None)
++    if root:
++        return pathlib.Path(root).expanduser().resolve()
++
++    repo_id = data_config.repo_id or ""
++    if repo_id.startswith(_AXIS_CLEAN_LOCAL_PREFIX):
++        return pathlib.Path(repo_id[len(_AXIS_CLEAN_LOCAL_PREFIX) :]).expanduser().resolve()
++
++    return None
++
++
++def _axis_clean_env_int(name: str) -> int | None:
++    raw_value = os.environ.get(name)
++    if raw_value is None or raw_value == "":
++        return None
++    value = int(raw_value)
++    if value < 1:
++        raise ValueError(f"{name} must be >= 1, got {value}")
++    return value
++
++
++def _axis_clean_task_id(path: pathlib.Path) -> int | None:
++    match = re.match(r"task_(\d+)_", path.name)
++    return int(match.group(1)) if match else None
++
++
++def _axis_clean_selected_task_dirs(root: pathlib.Path) -> list[pathlib.Path]:
++    if not root.exists():
++        raise FileNotFoundError(f"AXIS clean data root not found: {root}")
++
++    task_dirs = sorted(path for path in root.glob("task_*_isaac_state_train") if path.is_dir())
++    explicit_task_ids = os.environ.get("OPENPI_AXIS_CLEAN_TASK_IDS")
++    if explicit_task_ids:
++        selected_ids = {
++            int(value.strip())
++            for value in explicit_task_ids.replace(";", ",").split(",")
++            if value.strip()
++        }
++        task_dirs = [path for path in task_dirs if _axis_clean_task_id(path) in selected_ids]
++
++    max_tasks = _axis_clean_env_int("OPENPI_AXIS_CLEAN_MAX_TASKS")
++    if max_tasks is not None:
++        task_dirs = task_dirs[:max_tasks]
++
++    if not task_dirs:
++        raise FileNotFoundError(
++            f"No AXIS clean task directories selected under {root}. "
++            "Check OPENPI_AXIS_CLEAN_TASK_IDS / OPENPI_AXIS_CLEAN_MAX_TASKS."
++        )
++    return task_dirs
++
++
++def _axis_clean_tasks_by_index(task_dir: pathlib.Path) -> dict[int, str]:
++    tasks_path = task_dir / "meta" / "tasks.parquet"
++    if not tasks_path.exists():
++        return {}
++
++    tasks_df = pd.read_parquet(tasks_path).reset_index()
++    tasks: dict[int, str] = {}
++    for default_index, row in tasks_df.iterrows():
++        task_index = int(row["task_index"]) if "task_index" in row else int(default_index)
++        if "task" in row:
++            prompt = str(row["task"])
++        else:
++            prompt = str(row.iloc[0])
++        tasks[task_index] = prompt
++    return tasks
++
++
++class AxisCleanLocalLeRobotV3Dataset(torch.utils.data.Dataset):
++    """Local multi-task AXIS-format LeRobot-v3 reader.
++
++    Source state/action must be 9D:
++        [left_gripper_qpos, right_gripper_qpos, arm_joint_1, ..., arm_joint_7]
++
++    Returned samples use OpenPI's DROID keys and 8D DROID-style state/actions.
++    """
++
++    def __init__(
++        self,
++        root: str | pathlib.Path,
++        *,
++        action_horizon: int,
++        velocity_scale: float = 1.0 / 15.0,
++        downsample_ratio: int = 2,
++        gripper_open_q: Sequence[float] = (0.04, 0.04),
++        gripper_close_q: Sequence[float] = (0.0, 0.0),
++        clip_velocity_actions: bool = True,
++    ):
++        self._root = pathlib.Path(root).expanduser().resolve()
++        self._action_horizon = int(action_horizon)
++        self._velocity_scale = float(velocity_scale)
++        self._downsample_ratio = int(downsample_ratio)
++        if self._downsample_ratio < 1:
++            raise ValueError(f"downsample_ratio must be >= 1, got {downsample_ratio}")
++        self._gripper_open_q = tuple(float(value) for value in gripper_open_q)
++        self._gripper_close_q = tuple(float(value) for value in gripper_close_q)
++        self._clip_velocity_actions = bool(clip_velocity_actions)
++        self._max_samples_per_task = _axis_clean_env_int("OPENPI_AXIS_CLEAN_MAX_SAMPLES_PER_TASK")
++        self._video_container_cache_size = int(os.environ.get("OPENPI_AXIS_CLEAN_VIDEO_CONTAINER_CACHE_SIZE", "16"))
++        self._video_container_cache = collections.OrderedDict()
++
++        self._stores: list[dict] = []
++        self._cumulative_lengths: list[int] = []
++        total = 0
++        skipped = 0
++
++        for task_dir in _axis_clean_selected_task_dirs(self._root):
++            try:
++                store = self._load_task(task_dir)
++            except (FileNotFoundError, KeyError, ValueError) as exc:
++                skipped += 1
++                logging.warning("Skipping AXIS clean task %s: %s", task_dir, exc)
++                continue
++
++            total += int(store["length"])
++            self._stores.append(store)
++            self._cumulative_lengths.append(total)
++
++        if total == 0:
++            raise ValueError(f"AXIS clean dataset is empty after scanning {self._root}; skipped={skipped}")
++
++        logging.info(
++            "Loaded AXIS clean LeRobot-v3 dataset: root=%s tasks=%d skipped=%d samples=%d "
++            "downsample_ratio=%d velocity_scale=%.6f",
++            self._root,
++            len(self._stores),
++            skipped,
++            total,
++            self._downsample_ratio,
++            self._velocity_scale,
++        )
++
++    def __getstate__(self):
++        state = self.__dict__.copy()
++        state["_video_container_cache"] = collections.OrderedDict()
++        return state
++
++    def _get_video_stream(self, path: str):
++        import av
++
++        cached = self._video_container_cache.get(path)
++        if cached is not None:
++            self._video_container_cache.move_to_end(path)
++            return cached
++
++        container = av.open(path)
++        stream = container.streams.video[0]
++        cached = (container, stream)
++        self._video_container_cache[path] = cached
++        if self._video_container_cache_size > 0:
++            while len(self._video_container_cache) > self._video_container_cache_size:
++                _, (old_container, _) = self._video_container_cache.popitem(last=False)
++                old_container.close()
++        return cached
++
++    def _load_task(self, task_dir: pathlib.Path) -> dict:
++        info_path = task_dir / "meta" / "info.json"
++        if not info_path.exists():
++            raise FileNotFoundError(f"missing {info_path}")
++        info = json.loads(info_path.read_text(encoding="utf-8"))
++        fps = float(info.get("fps", 30))
++        video_path_template = str(
++            info.get("video_path", "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4")
++        )
++
++        episode_files = sorted((task_dir / "meta" / "episodes").glob("**/*.parquet"))
++        data_files = sorted((task_dir / "data").glob("**/*.parquet"))
++        if not episode_files:
++            raise FileNotFoundError("missing meta/episodes parquet files")
++        if not data_files:
++            raise FileNotFoundError("missing data parquet files")
++
++        episodes = pd.concat([pd.read_parquet(path) for path in episode_files], ignore_index=True)
++        episodes = episodes.sort_values("episode_index").reset_index(drop=True)
++        required_episode_columns = (
++            "dataset_to_index",
++            "videos/observation.images.third_person/chunk_index",
++            "videos/observation.images.third_person/file_index",
++            "videos/observation.images.third_person/from_timestamp",
++            "videos/observation.images.wrist/chunk_index",
++            "videos/observation.images.wrist/file_index",
++            "videos/observation.images.wrist/from_timestamp",
++        )
++        missing_episode_columns = [column for column in required_episode_columns if column not in episodes]
++        if missing_episode_columns:
++            raise KeyError(f"missing episode video columns: {missing_episode_columns}")
++
++        data = pd.concat([pd.read_parquet(path) for path in data_files], ignore_index=True)
++        data = data.sort_values("index").reset_index(drop=True)
++        states = np.stack(data["observation.state"].to_numpy()).astype(np.float32)
++        actions = np.stack(data["action"].to_numpy()).astype(np.float32)
++        if states.shape != actions.shape or states.ndim != 2 or states.shape[1] != 9:
++            raise ValueError(f"expected state/action arrays with shape (N, 9), got {states.shape} and {actions.shape}")
++
++        episode_ends = episodes["dataset_to_index"].to_numpy(np.int64)
++        if episode_ends.ndim != 1 or len(episode_ends) == 0 or int(episode_ends[-1]) > len(states):
++            raise ValueError(f"invalid dataset_to_index values: last={episode_ends[-1] if len(episode_ends) else None}")
++
++        sample_indices = axis_downsampled_frame_indices(episode_ends, self._downsample_ratio)
++        if self._max_samples_per_task is not None and len(sample_indices) > self._max_samples_per_task:
++            sample_indices = sample_indices[
++                np.linspace(0, len(sample_indices) - 1, self._max_samples_per_task, dtype=np.int64)
++            ]
++        if len(sample_indices) == 0:
++            raise ValueError("no sampled frames")
++
++        return {
++            "path": task_dir,
++            "fps": fps,
++            "video_path_template": video_path_template,
++            "episodes": episodes.set_index("episode_index"),
++            "episode_ends": episode_ends,
++            "timestamps": data["timestamp"].to_numpy(np.float32),
++            "episode_indices": data["episode_index"].to_numpy(np.int64),
++            "task_indices": data["task_index"].to_numpy(np.int64),
++            "tasks": _axis_clean_tasks_by_index(task_dir),
++            "state": states,
++            "action": actions,
++            "sample_indices": sample_indices,
++            "length": int(len(sample_indices)),
++        }
++
++    def __len__(self) -> int:
++        return self._cumulative_lengths[-1]
++
++    def _read_video_frame(self, path: str, frame_index: int) -> np.ndarray:
++        container, stream = self._get_video_stream(path)
++        target_pts = int(round(int(frame_index) / float(stream.average_rate) / float(stream.time_base)))
++        container.seek(target_pts, any_frame=False, backward=True, stream=stream)
++        last_frame = None
++        for frame in container.decode(stream):
++            last_frame = frame
++            if frame.pts is None or frame.pts >= target_pts:
++                return frame.to_ndarray(format="rgb24")
++        if last_frame is None:
++            raise IndexError(f"No frames decoded from {path}")
++        return last_frame.to_ndarray(format="rgb24")
++
++    def _image_at(self, store: dict, video_key: str, local_index: int) -> np.ndarray:
++        episode_index = int(store["episode_indices"][local_index])
++        episode = store["episodes"].loc[episode_index]
++        prefix = f"videos/{video_key}"
++        video_timestamp = float(episode[f"{prefix}/from_timestamp"]) + float(store["timestamps"][local_index])
++        frame_index = int(round(video_timestamp * float(store["fps"])))
++        filename = store["video_path_template"].format(
++            video_key=video_key,
++            chunk_index=int(episode[f"{prefix}/chunk_index"]),
++            file_index=int(episode[f"{prefix}/file_index"]),
++        )
++        return self._read_video_frame(str(store["path"] / filename), frame_index)
++
++    def _state_actions_for_indices(self, store: dict, local_indices: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
++        episode_ends = store["episode_ends"]
++        episode_indices = np.searchsorted(episode_ends, local_indices, side="right")
++        batch_episode_ends = episode_ends[episode_indices]
++        action_indices = np.minimum(
++            local_indices[:, None]
++            + np.arange(self._action_horizon, dtype=np.int64)[None, :] * self._downsample_ratio,
++            batch_episode_ends[:, None] - 1,
++        )
++        states = axis_droid_state_from_qpos(
++            store["state"][local_indices],
++            gripper_open_q=self._gripper_open_q,
++            gripper_close_q=self._gripper_close_q,
++        )
++        actions = axis_droid_actions_from_qpos(
++            store["state"][action_indices],
++            store["action"][action_indices],
++            velocity_scale=self._velocity_scale,
++            gripper_open_q=self._gripper_open_q,
++            gripper_close_q=self._gripper_close_q,
++            clip_velocity_actions=self._clip_velocity_actions,
++        )
++        return states, actions
++
++    def iter_state_action_batches(
++        self,
++        *,
++        batch_size: int = 8192,
++        max_frames: int | None = None,
++    ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
++        per_store_limit = None
++        if max_frames is not None:
++            per_store_limit = max(1, int(np.ceil(max_frames / len(self._stores))))
++        emitted = 0
++
++        for store in self._stores:
++            selected = store["sample_indices"]
++            if per_store_limit is not None and len(selected) > per_store_limit:
++                selected = selected[np.linspace(0, len(selected) - 1, per_store_limit, dtype=np.int64)]
++
++            for start in range(0, len(selected), batch_size):
++                if max_frames is not None and emitted >= max_frames:
++                    return
++                frame_indices = selected[start : start + batch_size]
++                if max_frames is not None:
++                    frame_indices = frame_indices[: max_frames - emitted]
++                emitted += len(frame_indices)
++                yield self._state_actions_for_indices(store, frame_indices)
++
++    def __getitem__(self, index: SupportsIndex) -> dict:
++        global_index = int(index.__index__())
++        if global_index < 0:
++            global_index += len(self)
++        if global_index < 0 or global_index >= len(self):
++            raise IndexError(global_index)
++
++        store_index = bisect.bisect_right(self._cumulative_lengths, global_index)
++        previous_total = 0 if store_index == 0 else self._cumulative_lengths[store_index - 1]
++        local_sample_index = global_index - previous_total
++        store = self._stores[store_index]
++        local_index = int(store["sample_indices"][local_sample_index])
++        state, actions = self._state_actions_for_indices(store, np.asarray([local_index], dtype=np.int64))
++        task_index = int(store["task_indices"][local_index])
++
++        return {
++            "observation.exterior_image_1_left": self._image_at(store, "observation.images.third_person", local_index),
++            "observation.wrist_image_left": self._image_at(store, "observation.images.wrist", local_index),
++            "observation.joint_position": state[0, :7],
++            "observation.gripper_position": state[0, 7:8],
++            "actions": actions[0],
++            "prompt": store["tasks"].get(task_index, store["path"].name),
++        }
++
++
++def compute_axis_clean_droid_norm_stats(
++    data_config: _config.DataConfig,
++    action_horizon: int,
++    *,
++    max_frames: int | None = None,
++    batch_size: int = 8192,
++) -> dict[str, _transforms.NormStats]:
++    root = axis_clean_local_root(data_config)
++    if root is None:
++        raise ValueError("AXIS clean root is not configured.")
++
++    dataset = AxisCleanLocalLeRobotV3Dataset(
++        root,
++        action_horizon=action_horizon,
++        velocity_scale=data_config.axis_clean_velocity_scale,
++        downsample_ratio=data_config.axis_clean_downsample_ratio,
++        gripper_open_q=data_config.axis_clean_gripper_open_q,
++        gripper_close_q=data_config.axis_clean_gripper_close_q,
++        clip_velocity_actions=data_config.axis_clean_clip_velocity_actions,
++    )
++    stats = {key: _normalize.RunningStats() for key in ["state", "actions"]}
++    total = 0
++    for states, actions in dataset.iter_state_action_batches(batch_size=batch_size, max_frames=max_frames):
++        stats["state"].update(states)
++        stats["actions"].update(actions)
++        total += states.shape[0]
++    if total == 0:
++        raise ValueError("No frames selected for AXIS clean norm stats.")
++    return {key: value.get_statistics() for key, value in stats.items()}
++
++
++def axis_droid_closedness_from_widths(
++    gripper_qpos: np.ndarray,
++    *,
++    open_q: Sequence[float],
++    close_q: Sequence[float],
++) -> np.ndarray:
++    qpos = np.asarray(gripper_qpos, dtype=np.float32)
++    open_arr = np.asarray(open_q, dtype=np.float32)
++    close_arr = np.asarray(close_q, dtype=np.float32)
++    if qpos.shape[-1] != open_arr.shape[0] or qpos.shape[-1] != close_arr.shape[0]:
++        raise ValueError(
++            "gripper_qpos, open_q, and close_q must have the same final dimension: "
++            f"qpos={qpos.shape} open={open_arr.shape} close={close_arr.shape}"
++        )
++    denom = np.where(np.abs(open_arr - close_arr) > 1e-6, open_arr - close_arr, 1e-6)
++    open_ratio = np.clip((qpos - close_arr) / denom, 0.0, 1.0).mean(axis=-1, keepdims=True)
++    return (1.0 - open_ratio).astype(np.float32)
++
++
++def axis_droid_state_from_qpos(
++    source_state: np.ndarray,
++    *,
++    gripper_open_q: Sequence[float],
++    gripper_close_q: Sequence[float],
++) -> np.ndarray:
++    source_state = np.asarray(source_state, dtype=np.float32)
++    if source_state.shape[-1] != 9:
++        raise ValueError(f"Expected AXIS joint state/action dim 9, got {source_state.shape}")
++    arm_state = source_state[..., 2:9]
++    gripper_closedness = axis_droid_closedness_from_widths(
++        source_state[..., :2],
++        open_q=gripper_open_q,
++        close_q=gripper_close_q,
++    )
++    return np.concatenate([arm_state, gripper_closedness], axis=-1).astype(np.float32)
++
++
++def axis_droid_actions_from_qpos(
++    source_state: np.ndarray,
++    source_action: np.ndarray,
++    *,
++    velocity_scale: float,
++    gripper_open_q: Sequence[float],
++    gripper_close_q: Sequence[float],
++    clip_velocity_actions: bool,
++) -> np.ndarray:
++    source_state = np.asarray(source_state, dtype=np.float32)
++    source_action = np.asarray(source_action, dtype=np.float32)
++    if source_state.shape[-1] != 9 or source_action.shape[-1] != 9:
++        raise ValueError(f"Expected AXIS joint state/action dim 9, got {source_state.shape} and {source_action.shape}")
++    if velocity_scale <= 0.0:
++        raise ValueError(f"velocity_scale must be positive, got {velocity_scale}")
++
++    arm_velocity_style_action = (source_action[..., 2:9] - source_state[..., 2:9]) / float(velocity_scale)
++    if clip_velocity_actions:
++        arm_velocity_style_action = np.clip(arm_velocity_style_action, -1.0, 1.0)
++    gripper_closedness = axis_droid_closedness_from_widths(
++        source_action[..., :2],
++        open_q=gripper_open_q,
++        close_q=gripper_close_q,
++    )
++    return np.concatenate([arm_velocity_style_action, gripper_closedness], axis=-1).astype(np.float32)
++
++
++def axis_downsampled_frame_indices(episode_ends: np.ndarray, downsample_ratio: int) -> np.ndarray:
++    ratio = int(downsample_ratio)
++    if ratio < 1:
++        raise ValueError(f"downsample_ratio must be >= 1, got {downsample_ratio}")
++
++    ends = np.asarray(episode_ends, dtype=np.int64)
++    if ends.ndim != 1 or len(ends) == 0:
++        raise ValueError(f"episode_ends must be a non-empty 1D array, got {ends.shape}")
++
++    selected: list[np.ndarray] = []
++    episode_start = 0
++    for episode_end in ends:
++        episode_end = int(episode_end)
++        if episode_end <= episode_start:
++            raise ValueError(f"episode_ends must be strictly increasing, got {ends}")
++        selected.append(np.arange(episode_start, episode_end, ratio, dtype=np.int64))
++        episode_start = episode_end
++
++    return np.concatenate(selected) if selected else np.empty((0,), dtype=np.int64)
++
++
+ def create_torch_dataset(
+     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
+ ) -> Dataset:
+@@ -136,6 +589,16 @@ def create_torch_dataset(
+         raise ValueError("Repo ID is not set. Cannot create dataset.")
+     if repo_id == "fake":
+         return FakeDataset(model_config, num_samples=1024)
++    if (axis_clean_root := axis_clean_local_root(data_config)) is not None:
++        return AxisCleanLocalLeRobotV3Dataset(
++            axis_clean_root,
++            action_horizon=action_horizon,
++            velocity_scale=data_config.axis_clean_velocity_scale,
++            downsample_ratio=data_config.axis_clean_downsample_ratio,
++            gripper_open_q=data_config.axis_clean_gripper_open_q,
++            gripper_close_q=data_config.axis_clean_gripper_close_q,
++            clip_velocity_actions=data_config.axis_clean_clip_velocity_actions,
++        )
+ 
+     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+     dataset = lerobot_dataset.LeRobotDataset(

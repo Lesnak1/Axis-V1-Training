@@ -1,0 +1,32 @@
+action_conversion:
+  input_dim: 9
+  output_dim: 8
+
+  # AXIS-format LeRobot data uses Franka-like joint order:
+  # two gripper finger joints first, then seven arm joints.
+  raw_layout:
+    arm: [2, 3, 4, 5, 6, 7, 8]
+    gripper: [0, 1]
+
+  output_layout:
+    arm: [0, 1, 2, 3, 4, 5, 6]
+    gripper: [7]
+
+  arm:
+    copy: true
+    type: joint_position
+
+  gripper:
+    mode: same_direction
+    open_width: auto_q99
+    closed_width: auto_q01
+    output_open: 0.0
+    output_closed: 1.0
+    clip: [0.0, 1.0]
+
+  preserve_raw_action: true
+
+checks:
+  min_gripper_dynamic_range: 0.001
+  max_gripper_clip_rate: 0.05
+  arm_copy_tolerance: 1.0e-6
