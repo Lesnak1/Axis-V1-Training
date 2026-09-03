@@ -73,7 +73,7 @@ second YAML training config to drift.
 ## Rendering boundary
 
 The reference repository cloned at
-`MurphyZhao04/training-infra@e137743670825f8822ff869ff9983f33ab349382`
+`AxisAIOrg/axis-training-infra@e137743670825f8822ff869ff9983f33ab349382`
 has three commits. Commit `07378fe` imports the complete Learn-from-Failure
 low-dimensional training/evaluation system. The latest commit `e137743` adds a
 separate reproducible rendering subsystem: MuJoCo and Isaac Sim backends,
