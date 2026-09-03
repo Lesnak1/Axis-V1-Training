@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import shutil
 from dataclasses import dataclass
@@ -119,17 +120,53 @@ def convert_dataset(
     shutil.copytree(src.path / "meta", dst_path / "meta", symlinks=True)
     copy_tree_or_symlink(src.videos_dir, dst_path / "videos", symlink=symlink_videos)
 
-    all_raw: list[np.ndarray] = []
+    data_files = src.iter_data_files()
+    if not data_files:
+        raise FileNotFoundError(f"No parquet data files under {src.data_dir}")
+
+    raw_by_file = [column_to_numpy(pq.read_table(path, columns=["action"]), "action") for path in data_files]
+    raw_all = np.concatenate(raw_by_file, axis=0).astype(np.float32, copy=False)
+
+    calibration_mask = np.ones(raw_all.shape[0], dtype=bool)
+    info = src.load_info()
+    transition_contract = info.get("axis_transition_contract", {})
+    terminal_padding = bool(transition_contract.get("terminal_action_padding", False))
+    if terminal_padding:
+        episodes = src.read_episodes_table()
+        if "dataset_to_index" not in episodes.column_names:
+            raise KeyError("terminal_action_padding requires episode metadata column dataset_to_index")
+        episode_ends = np.asarray(episodes["dataset_to_index"].to_pylist(), dtype=np.int64)
+        if (
+            episode_ends.ndim != 1
+            or len(episode_ends) == 0
+            or np.any(episode_ends <= 0)
+            or np.any(np.diff(episode_ends) <= 0)
+            or int(episode_ends[-1]) != len(raw_all)
+        ):
+            raise ValueError(
+                "terminal_action_padding requires strictly increasing dataset_to_index values "
+                f"ending at {len(raw_all)}, got {episode_ends.tolist()}"
+            )
+        calibration_mask[episode_ends - 1] = False
+    if not calibration_mask.any():
+        raise ValueError("Dataset has no real action rows after terminal padding is excluded")
+
+    calibration = convert_actions(raw_all[calibration_mask], cfg)
+    resolved_cfg = copy.deepcopy(cfg)
+    resolved_action_cfg = resolved_cfg.setdefault("action_conversion", {}) if "action_conversion" in cfg else resolved_cfg
+    resolved_gripper_cfg = resolved_action_cfg.setdefault("gripper", {})
+    resolved_gripper_cfg["open_width"] = calibration.open_width
+    resolved_gripper_cfg["closed_width"] = calibration.closed_width
+
     all_converted: list[np.ndarray] = []
     per_file_reports: list[dict[str, Any]] = []
 
-    for data_file in src.iter_data_files():
+    for data_file, raw in zip(data_files, raw_by_file, strict=True):
         rel = data_file.relative_to(src.path)
         out_file = dst_path / rel
         ensure_dir(out_file.parent)
         table = pq.read_table(data_file)
-        raw = column_to_numpy(table, "action")
-        result = convert_actions(raw, cfg)
+        result = convert_actions(raw, resolved_cfg)
 
         action_array = pa.array(result.actions_8d.tolist(), type=pa.list_(pa.float32()))
         table = table.set_column(table.column_names.index("action"), "action", action_array)
@@ -138,7 +175,6 @@ def convert_dataset(
             table = table.append_column("action.raw_9d", raw_array)
         pq.write_table(table, out_file, compression="zstd")
 
-        all_raw.append(raw.astype(np.float32))
         all_converted.append(result.actions_8d)
         per_file_reports.append(
             {
@@ -150,9 +186,8 @@ def convert_dataset(
             }
         )
 
-    raw_all = np.concatenate(all_raw, axis=0)
     converted_all = np.concatenate(all_converted, axis=0)
-    total_result = convert_actions(raw_all, cfg)
+    total_result = convert_actions(raw_all[calibration_mask], resolved_cfg)
 
     info_path = dst_path / "meta" / "info.json"
     with info_path.open("r", encoding="utf-8") as f:
@@ -175,6 +210,9 @@ def convert_dataset(
         "conversion_config": str(Path(config_path).resolve()),
         "canonical_action_dim": 8,
         "raw_action_dim": 9,
+        "gripper_open_width": total_result.open_width,
+        "gripper_closed_width": total_result.closed_width,
+        "terminal_action_padding_excluded_from_calibration": terminal_padding,
     }
     with info_path.open("w", encoding="utf-8") as f:
         json.dump(info, f, indent=2)
@@ -182,9 +220,9 @@ def convert_dataset(
 
     stats_path = dst_path / "meta" / "stats.json"
     stats = src.load_stats()
-    stats["action"] = compute_array_stats(converted_all)
+    stats["action"] = compute_array_stats(converted_all[calibration_mask])
     if cfg.get("action_conversion", {}).get("preserve_raw_action", True):
-        stats["action.raw_9d"] = compute_array_stats(raw_all)
+        stats["action.raw_9d"] = compute_array_stats(raw_all[calibration_mask])
     with stats_path.open("w", encoding="utf-8") as f:
         json.dump(stats, f, indent=2)
         f.write("\n")
@@ -221,6 +259,8 @@ def convert_dataset(
         },
         "files": per_file_reports,
         "num_frames": int(converted_all.shape[0]),
+        "num_real_action_rows": int(calibration_mask.sum()),
+        "terminal_action_padding_rows": int((~calibration_mask).sum()),
     }
     report_path = dst_path / "meta" / "axis_train_action_conversion_report.json"
     write_json(report_path, report)

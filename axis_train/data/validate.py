@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -108,7 +107,9 @@ def validate_lerobot_dataset(
         video_files = sorted(video_dir.glob("chunk-*/file-*.mp4")) if video_dir.exists() else []
         checks.append(_check(f"video_files_exist:{video_key}", bool(video_files), str(video_dir)))
         if decode_video and video_files:
-            video_reports.append(_decode_video_sample(video_files[0]))
+            report = _decode_video_sample(video_files[0])
+            video_reports.append(report)
+            checks.append(_check(f"video_decodable:{video_key}", bool(report.get("ok")), report))
 
     summary = {
         "dataset_path": str(dataset.path.resolve()),

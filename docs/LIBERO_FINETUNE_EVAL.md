@@ -75,7 +75,7 @@ From this repo:
 
 ```bash
 export OPENPI_ROOT="$PWD/third_party/openpi"
-OPENPI_SERVE_ENV=LIBERO bash training/run_serve_openpi_policy.sh \
+axis-train serve --serve-env LIBERO \
   pi05_libero \
   "$OPENPI_ROOT/checkpoints/pi05_libero/libero_pi05_v001/29999"
 ```
@@ -85,7 +85,7 @@ OPENPI_SERVE_ENV=LIBERO bash training/run_serve_openpi_policy.sh \
 From this repo:
 
 ```bash
-bash training/run_libero_eval.sh \
+axis-train libero-eval \
   --args.task-suite-name libero_10 \
   --args.num-trials-per-task 50 \
   --args.video-out-path data/libero/videos
@@ -97,7 +97,8 @@ checkout.
 
 ## Expected Evaluation Flow
 
-1. Start the OpenPI policy server with `training/run_serve_openpi_policy.sh`.
-2. Start LIBERO evaluation from `examples/libero/main.py`.
+1. Start the OpenPI policy server with `axis-train serve --serve-env LIBERO`.
+2. Start LIBERO evaluation with `axis-train libero-eval` (it delegates to
+   `examples/libero/main.py` in the isolated LIBERO environment).
 3. Confirm the evaluator is connecting to the policy server.
 4. Save videos and success metrics under a run-specific output directory.

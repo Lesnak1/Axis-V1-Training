@@ -1,6 +1,6 @@
 dataset:
   name: axis_raw_9d
-  path: ${AXIS_TASK_DATASET:-datasets/axis_clean/task_0000_train}
+  path: ${AXIS_TASK_DATASET:-datasets/axis_clean/task_0000_mujoco_state_train}
   format: lerobot_v3
   fps: 30
 
@@ -17,4 +17,4 @@ dataset:
 
   source:
     dynamics: mujoco_collection
-    rendering: isaaclab
+    rendering: simulator_state_replay

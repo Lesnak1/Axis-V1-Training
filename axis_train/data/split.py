@@ -19,6 +19,14 @@ def make_episode_split(
     seed: int = 0,
     id_format: str = "int",
 ) -> dict[str, Any]:
+    ratios = np.asarray([train_ratio, val_ratio, test_ratio], dtype=np.float64)
+    if not np.isfinite(ratios).all() or np.any(ratios < 0):
+        raise ValueError(f"Split ratios must be finite and non-negative, got {ratios.tolist()}")
+    if not np.isclose(float(ratios.sum()), 1.0, atol=1.0e-8):
+        raise ValueError(f"Split ratios must sum to 1.0, got {float(ratios.sum())}")
+    if train_ratio <= 0:
+        raise ValueError("train_ratio must be positive")
+
     dataset = LeRobotV3Dataset.from_path(dataset_path)
     episodes = dataset.read_episodes_table()
     episode_ids = np.asarray(episodes["episode_index"].to_pylist(), dtype=np.int64)

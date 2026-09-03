@@ -1,0 +1,15 @@
+{
+  "asset_dir": "assets/training_scenes_split_v2/assets",
+  "camera_contract": "/root/workspace/murphy/wls/.ai/tasks/20260825-0849-DreamZero训练/artifacts/task_3801_camera_contract_level0_single_arm_v2.json",
+  "runtime": {
+    "max_controls": 250,
+    "replan_interval": 15,
+    "role": "development_evaluation",
+    "samples_per_replan": 1
+  },
+  "scene_split": "/root/workspace/murphy/wls/.ai/tasks/20260825-0849-DreamZero训练/artifacts/task_3801_scene_split_v2.json",
+  "schema_version": "axis_task_profile_v1",
+  "task_contract": "task_contract_source_prod_20260826_v1",
+  "task_id": 3801,
+  "task_root": "/data/wls_assets/axis/task_3801"
+}

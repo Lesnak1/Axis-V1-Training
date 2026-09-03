@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import numpy as np
-
 from axis_train.data.action_conversion import convert_actions
 
 

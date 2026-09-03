@@ -49,7 +49,7 @@ index c8aef87..0fdb6ad 100644
      output_path = config.assets_dirs / data_config.repo_id
      print(f"Writing stats to: {output_path}")
 diff --git a/src/openpi/training/config.py b/src/openpi/training/config.py
-index 4ca47e1..6bb01f3 100644
+index 4ca47e1..79a2fa4 100644
 --- a/src/openpi/training/config.py
 +++ b/src/openpi/training/config.py
 @@ -5,6 +5,7 @@ from collections.abc import Sequence
@@ -60,10 +60,22 @@ index 4ca47e1..6bb01f3 100644
  import pathlib
  from typing import Any, Literal, Protocol, TypeAlias
  
-@@ -34,6 +35,16 @@ ModelType: TypeAlias = _model.ModelType
+@@ -34,6 +35,38 @@ ModelType: TypeAlias = _model.ModelType
  Filter: TypeAlias = nnx.filterlib.Filter
  
  
++def _axis_env_bool(name: str, *, default: bool) -> bool:
++    raw = os.environ.get(name)
++    if raw is None:
++        return default
++    normalized = raw.strip().lower()
++    if normalized in {"1", "true", "yes", "on"}:
++        return True
++    if normalized in {"0", "false", "no", "off"}:
++        return False
++    raise ValueError(f"{name} must be a boolean, got {raw!r}")
++
++
 +def _freeze_pi05_lora(path: nnx.filterlib.PathParts, _param: Any) -> bool:
 +    """Freeze vision backbones and non-LoRA language weights for Pi0.5 LoRA fine-tuning."""
 +    param_path = "/".join(str(part) for part in path)
@@ -74,15 +86,35 @@ index 4ca47e1..6bb01f3 100644
 +    return False
 +
 +
++def _freeze_pi05_backbones_for_action_expert(path: nnx.filterlib.PathParts, _param: Any) -> bool:
++    """Freeze vision/language backbones while fully training the action expert and projections."""
++    param_path = "/".join(str(part) for part in path)
++    if param_path.startswith("PaliGemma/img/"):
++        return True
++    if param_path.startswith("PaliGemma/llm/"):
++        return "_1" not in param_path
++    return False
++
++
  @dataclasses.dataclass(frozen=True)
  class AssetsConfig:
      """Determines the location of assets (e.g., norm stats) that will be used to set up the data pipeline.
-@@ -92,6 +103,16 @@ class DataConfig:
+@@ -73,6 +106,9 @@ class DataConfig:
+     # Used to adopt the inputs from a dataset specific format to a common format
+     # which is expected by the data transforms.
+     repack_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
++    # Optional inference-only repack. Unlike dataset repacking, this must not
++    # require a ground-truth action key from a live policy observation.
++    policy_repack_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
+     # Data transforms, typically include robot specific transformations. Will be applied
+     # before the data is normalized. See `model.Observation` and `model.Actions` to learn about the
+     # normalized data.
+@@ -92,6 +128,16 @@ class DataConfig:
  
      # Only used for RLDS data loader (ie currently only used for DROID).
      rlds_data_dir: str | None = None
 +
-+    # Local AXIS-format LeRobot root. This root contains task_*_isaac_state_train
++    # Local AXIS-format LeRobot root. This root contains task_*_<simulator>_state_train
 +    # LeRobot-v3 datasets with 9D [two gripper fingers, seven arm joints]
 +    # state/action arrays and front/wrist videos.
 +    axis_clean_root: str | None = None
@@ -90,11 +122,11 @@ index 4ca47e1..6bb01f3 100644
 +    axis_clean_downsample_ratio: int = 2
 +    axis_clean_gripper_open_q: tuple[float, ...] = (0.04, 0.04)
 +    axis_clean_gripper_close_q: tuple[float, ...] = (0.0, 0.0)
-+    axis_clean_clip_velocity_actions: bool = True
++    axis_clean_clip_velocity_actions: bool = False
      # Action space for DROID dataset.
      action_space: droid_rlds_dataset.DroidActionSpace | None = None
      # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
-@@ -355,6 +376,64 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
+@@ -355,6 +401,78 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
          )
  
  
@@ -102,7 +134,7 @@ index 4ca47e1..6bb01f3 100644
 +class LeRobotAxisCleanDroidDataConfig(DataConfigFactory):
 +    """Local AXIS-format LeRobot-v3 data adapted to the Pi0.5-DROID schema.
 +
-+    The source export is a directory of task_*_isaac_state_train LeRobot-v3
++    The source export is a directory of task_*_<simulator>_state_train LeRobot-v3
 +    datasets with 30 Hz RoboVerse joint qpos state/action:
 +        [left_gripper_qpos, right_gripper_qpos, arm_joint_1, ..., arm_joint_7]
 +
@@ -113,11 +145,11 @@ index 4ca47e1..6bb01f3 100644
 +    repo_id: str = "local/axis_clean"
 +    clean_root: str = os.environ.get("AXIS_CLEAN_ROOT", "./datasets/axis_clean")
 +    action_sequence_keys: Sequence[str] = ("actions",)
-+    velocity_scale: float = float(os.environ.get("AXIS_CLEAN_DROID_VELOCITY_SCALE", 1.0 / 15.0))
-+    downsample_ratio: int = int(os.environ.get("AXIS_CLEAN_DROID_DOWNSAMPLE_RATIO", 2))
++    velocity_scale: float = float(os.environ.get("AXIS_CLEAN_DROID_VELOCITY_SCALE", "0.06666666666666667"))
++    downsample_ratio: int = int(os.environ.get("AXIS_CLEAN_DROID_DOWNSAMPLE_RATIO", "2"))
 +    gripper_open_q: tuple[float, ...] = (0.04, 0.04)
 +    gripper_close_q: tuple[float, ...] = (0.0, 0.0)
-+    clip_velocity_actions: bool = True
++    clip_velocity_actions: bool = _axis_env_bool("AXIS_CLEAN_DROID_CLIP_VELOCITY_ACTIONS", default=False)
 +
 +    @override
 +    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -135,6 +167,19 @@ index 4ca47e1..6bb01f3 100644
 +                )
 +            ]
 +        )
++        policy_repack_transform = _transforms.Group(
++            inputs=[
++                _transforms.RepackTransform(
++                    {
++                        "observation/exterior_image_1_left": "observation.exterior_image_1_left",
++                        "observation/wrist_image_left": "observation.wrist_image_left",
++                        "observation/joint_position": "observation.joint_position",
++                        "observation/gripper_position": "observation.gripper_position",
++                        "prompt": "prompt",
++                    }
++                )
++            ]
++        )
 +        data_transforms = _transforms.Group(
 +            inputs=[droid_policy.DroidInputs(model_type=model_config.model_type)],
 +            outputs=[droid_policy.DroidOutputs()],
@@ -144,6 +189,7 @@ index 4ca47e1..6bb01f3 100644
 +        return dataclasses.replace(
 +            self.create_base_config(assets_dirs, model_config),
 +            repack_transforms=repack_transform,
++            policy_repack_transforms=policy_repack_transform,
 +            data_transforms=data_transforms,
 +            model_transforms=model_transforms,
 +            action_sequence_keys=self.action_sequence_keys,
@@ -159,7 +205,7 @@ index 4ca47e1..6bb01f3 100644
  @dataclasses.dataclass(frozen=True)
  class RLDSDroidDataConfig(DataConfigFactory):
      """
-@@ -761,6 +840,113 @@ _CONFIGS = [
+@@ -761,6 +879,149 @@ _CONFIGS = [
          pytorch_weight_path="/path/to/your/pytorch_weight_path",
          num_train_steps=30_000,
      ),
@@ -207,12 +253,12 @@ index 4ca47e1..6bb01f3 100644
 +        # Set AXIS_PI05_FULL_INIT_PARAMS to continue from a custom CPT checkpoint;
 +        # otherwise this starts from the official Pi0.5-DROID checkpoint.
 +        name="pi05_axis_clean_local_droid_full",
-+        model=pi0_config.Pi0Config(pi05=True, action_horizon=15),
++        model=pi0_config.Pi0Config(
++            pi05=True,
++            action_horizon=int(os.environ.get("AXIS_CLEAN_DROID_ACTION_HORIZON", "15")),
++        ),
 +        data=LeRobotAxisCleanDroidDataConfig(
-+            assets=AssetsConfig(
-+                assets_dir=os.environ.get("AXIS_PI05_DROID_ASSETS", "gs://openpi-assets/checkpoints/pi05_droid/assets"),
-+                asset_id="droid",
-+            ),
++            assets=AssetsConfig(asset_id="local/axis_clean"),
 +            base_config=DataConfig(prompt_from_task=False),
 +        ),
 +        weight_loader=weight_loaders.CheckpointWeightLoader(
@@ -226,6 +272,7 @@ index 4ca47e1..6bb01f3 100644
 +        ),
 +        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
 +        num_train_steps=20_000,
++        assets_base_dir=os.environ.get("AXIS_PI05_ASSETS_BASE_DIR", "./assets"),
 +        batch_size=8,
 +        num_workers=0,
 +        save_interval=1_000,
@@ -239,15 +286,12 @@ index 4ca47e1..6bb01f3 100644
 +        name="pi05_axis_clean_local_droid_lora",
 +        model=pi0_config.Pi0Config(
 +            pi05=True,
-+            action_horizon=15,
++            action_horizon=int(os.environ.get("AXIS_CLEAN_DROID_ACTION_HORIZON", "15")),
 +            paligemma_variant="gemma_2b_lora",
 +            action_expert_variant="gemma_300m_lora",
 +        ),
 +        data=LeRobotAxisCleanDroidDataConfig(
-+            assets=AssetsConfig(
-+                assets_dir=os.environ.get("AXIS_PI05_DROID_ASSETS", "gs://openpi-assets/checkpoints/pi05_droid/assets"),
-+                asset_id="droid",
-+            ),
++            assets=AssetsConfig(asset_id="local/axis_clean"),
 +            base_config=DataConfig(prompt_from_task=False),
 +        ),
 +        weight_loader=weight_loaders.CheckpointWeightLoader(
@@ -261,6 +305,7 @@ index 4ca47e1..6bb01f3 100644
 +        ),
 +        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
 +        num_train_steps=20_000,
++        assets_base_dir=os.environ.get("AXIS_PI05_ASSETS_BASE_DIR", "./assets"),
 +        batch_size=8,
 +        num_workers=0,
 +        save_interval=1_000,
@@ -270,11 +315,78 @@ index 4ca47e1..6bb01f3 100644
 +        wandb_enabled=False,
 +        fsdp_devices=4,
 +    ),
++    TrainConfig(
++        # Single-GPU middle ground between LoRA and full fine-tuning: freeze the
++        # vision/language backbones and fully train the 300M action expert plus
++        # action/time projections.
++        name="pi05_axis_clean_local_droid_action_expert",
++        model=pi0_config.Pi0Config(
++            pi05=True,
++            action_horizon=int(os.environ.get("AXIS_CLEAN_DROID_ACTION_HORIZON", "15")),
++        ),
++        data=LeRobotAxisCleanDroidDataConfig(
++            assets=AssetsConfig(asset_id="local/axis_clean"),
++            base_config=DataConfig(prompt_from_task=False),
++        ),
++        weight_loader=weight_loaders.CheckpointWeightLoader(
++            os.environ.get(
++                "AXIS_PI05_ACTION_EXPERT_INIT_PARAMS",
++                os.environ.get("AXIS_PI05_FULL_INIT_PARAMS", "gs://openpi-assets/checkpoints/pi05_droid/params"),
++            )
++        ),
++        lr_schedule=_optimizer.CosineDecaySchedule(
++            warmup_steps=1_000,
++            peak_lr=5e-5,
++            decay_steps=100_000,
++            decay_lr=5e-5,
++        ),
++        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
++        num_train_steps=20_000,
++        assets_base_dir=os.environ.get("AXIS_PI05_ASSETS_BASE_DIR", "./assets"),
++        batch_size=8,
++        num_workers=0,
++        save_interval=1_000,
++        keep_period=5_000,
++        freeze_filter=_freeze_pi05_backbones_for_action_expert,
++        ema_decay=None,
++        wandb_enabled=False,
++        fsdp_devices=1,
++    ),
      #
      # Fine-tuning Aloha configs.
      #
+diff --git a/src/openpi/training/checkpoints.py b/src/openpi/training/checkpoints.py
+index f32a831..bb344f1 100644
+--- a/src/openpi/training/checkpoints.py
++++ b/src/openpi/training/checkpoints.py
+@@ -4,6 +4,8 @@ import asyncio
+ import concurrent.futures as futures
+ import dataclasses
+ import logging
++import os
++import shutil
+ from typing import Protocol
+ 
+ from etils import epath
+@@ -74,6 +76,16 @@ def save_state(
+         norm_stats = data_config.norm_stats
+         if norm_stats is not None and data_config.asset_id is not None:
+             _normalize.save(directory / data_config.asset_id, norm_stats)
++        action_transform_spec = os.environ.get("AXIS_ACTION_TRANSFORM_SPEC_PATH")
++        if action_transform_spec is not None:
++            if data_config.asset_id is None:
++                raise ValueError("AXIS_ACTION_TRANSFORM_SPEC_PATH requires a data asset_id")
++            source = epath.Path(action_transform_spec)
++            if not source.is_file():
++                raise FileNotFoundError(f"ActionTransformSpec not found: {source}")
++            target = directory / data_config.asset_id / "action_transform_spec.json"
++            target.parent.mkdir(parents=True, exist_ok=True)
++            shutil.copyfile(str(source), str(target))
+ 
+     # Split params that can be used for inference into a separate item.
+     with at.disable_typechecking():
 diff --git a/src/openpi/training/data_loader.py b/src/openpi/training/data_loader.py
-index e2ee7dd..bfb938d 100644
+index e2ee7dd..bb657ad 100644
 --- a/src/openpi/training/data_loader.py
 +++ b/src/openpi/training/data_loader.py
 @@ -1,7 +1,12 @@
@@ -302,7 +414,7 @@ index e2ee7dd..bfb938d 100644
  import openpi.training.config as _config
  from openpi.training.droid_rlds_dataset import DroidRldsDataset
  import openpi.transforms as _transforms
-@@ -127,6 +134,452 @@ class FakeDataset(Dataset):
+@@ -127,6 +134,453 @@ class FakeDataset(Dataset):
          return self._num_samples
  
  
@@ -340,14 +452,10 @@ index e2ee7dd..bfb938d 100644
 +    if not root.exists():
 +        raise FileNotFoundError(f"AXIS clean data root not found: {root}")
 +
-+    task_dirs = sorted(path for path in root.glob("task_*_isaac_state_train") if path.is_dir())
++    task_dirs = sorted(path for path in root.glob("task_*_state_train") if path.is_dir())
 +    explicit_task_ids = os.environ.get("OPENPI_AXIS_CLEAN_TASK_IDS")
 +    if explicit_task_ids:
-+        selected_ids = {
-+            int(value.strip())
-+            for value in explicit_task_ids.replace(";", ",").split(",")
-+            if value.strip()
-+        }
++        selected_ids = {int(value.strip()) for value in explicit_task_ids.replace(";", ",").split(",") if value.strip()}
 +        task_dirs = [path for path in task_dirs if _axis_clean_task_id(path) in selected_ids]
 +
 +    max_tasks = _axis_clean_env_int("OPENPI_AXIS_CLEAN_MAX_TASKS")
@@ -371,10 +479,7 @@ index e2ee7dd..bfb938d 100644
 +    tasks: dict[int, str] = {}
 +    for default_index, row in tasks_df.iterrows():
 +        task_index = int(row["task_index"]) if "task_index" in row else int(default_index)
-+        if "task" in row:
-+            prompt = str(row["task"])
-+        else:
-+            prompt = str(row.iloc[0])
++        prompt = str(row["task"]) if "task" in row else str(row.iloc[0])
 +        tasks[task_index] = prompt
 +    return tasks
 +
@@ -397,14 +502,16 @@ index e2ee7dd..bfb938d 100644
 +        downsample_ratio: int = 2,
 +        gripper_open_q: Sequence[float] = (0.04, 0.04),
 +        gripper_close_q: Sequence[float] = (0.0, 0.0),
-+        clip_velocity_actions: bool = True,
++        clip_velocity_actions: bool = False,
 +    ):
 +        self._root = pathlib.Path(root).expanduser().resolve()
 +        self._action_horizon = int(action_horizon)
 +        self._velocity_scale = float(velocity_scale)
 +        self._downsample_ratio = int(downsample_ratio)
-+        if self._downsample_ratio < 1:
-+            raise ValueError(f"downsample_ratio must be >= 1, got {downsample_ratio}")
++        if self._action_horizon < 1 or self._downsample_ratio < 1:
++            raise ValueError(
++                f"action_horizon and downsample_ratio must be >= 1, got {action_horizon} and {downsample_ratio}"
++            )
 +        self._gripper_open_q = tuple(float(value) for value in gripper_open_q)
 +        self._gripper_close_q = tuple(float(value) for value in gripper_close_q)
 +        self._clip_velocity_actions = bool(clip_velocity_actions)
@@ -506,10 +613,10 @@ index e2ee7dd..bfb938d 100644
 +            raise ValueError(f"expected state/action arrays with shape (N, 9), got {states.shape} and {actions.shape}")
 +
 +        episode_ends = episodes["dataset_to_index"].to_numpy(np.int64)
-+        if episode_ends.ndim != 1 or len(episode_ends) == 0 or int(episode_ends[-1]) > len(states):
++        if episode_ends.ndim != 1 or len(episode_ends) == 0 or int(episode_ends[-1]) != len(states):
 +            raise ValueError(f"invalid dataset_to_index values: last={episode_ends[-1] if len(episode_ends) else None}")
 +
-+        sample_indices = axis_downsampled_frame_indices(episode_ends, self._downsample_ratio)
++        sample_indices = axis_downsampled_frame_indices(episode_ends, self._downsample_ratio, self._action_horizon)
 +        if self._max_samples_per_task is not None and len(sample_indices) > self._max_samples_per_task:
 +            sample_indices = sample_indices[
 +                np.linspace(0, len(sample_indices) - 1, self._max_samples_per_task, dtype=np.int64)
@@ -530,7 +637,7 @@ index e2ee7dd..bfb938d 100644
 +            "state": states,
 +            "action": actions,
 +            "sample_indices": sample_indices,
-+            "length": int(len(sample_indices)),
++            "length": len(sample_indices),
 +        }
 +
 +    def __len__(self) -> int:
@@ -538,7 +645,7 @@ index e2ee7dd..bfb938d 100644
 +
 +    def _read_video_frame(self, path: str, frame_index: int) -> np.ndarray:
 +        container, stream = self._get_video_stream(path)
-+        target_pts = int(round(int(frame_index) / float(stream.average_rate) / float(stream.time_base)))
++        target_pts = round(int(frame_index) / float(stream.average_rate) / float(stream.time_base))
 +        container.seek(target_pts, any_frame=False, backward=True, stream=stream)
 +        last_frame = None
 +        for frame in container.decode(stream):
@@ -554,7 +661,7 @@ index e2ee7dd..bfb938d 100644
 +        episode = store["episodes"].loc[episode_index]
 +        prefix = f"videos/{video_key}"
 +        video_timestamp = float(episode[f"{prefix}/from_timestamp"]) + float(store["timestamps"][local_index])
-+        frame_index = int(round(video_timestamp * float(store["fps"])))
++        frame_index = round(video_timestamp * float(store["fps"]))
 +        filename = store["video_path_template"].format(
 +            video_key=video_key,
 +            chunk_index=int(episode[f"{prefix}/chunk_index"]),
@@ -566,11 +673,11 @@ index e2ee7dd..bfb938d 100644
 +        episode_ends = store["episode_ends"]
 +        episode_indices = np.searchsorted(episode_ends, local_indices, side="right")
 +        batch_episode_ends = episode_ends[episode_indices]
-+        action_indices = np.minimum(
-+            local_indices[:, None]
-+            + np.arange(self._action_horizon, dtype=np.int64)[None, :] * self._downsample_ratio,
-+            batch_episode_ends[:, None] - 1,
++        action_indices = (
++            local_indices[:, None] + np.arange(self._action_horizon, dtype=np.int64)[None, :] * self._downsample_ratio
 +        )
++        if np.any(action_indices >= batch_episode_ends[:, None] - 1):
++            raise IndexError("Action horizon touches terminal padding; sample index contract is invalid")
 +        states = axis_droid_state_from_qpos(
 +            store["state"][local_indices],
 +            gripper_open_q=self._gripper_open_q,
@@ -731,10 +838,15 @@ index e2ee7dd..bfb938d 100644
 +    return np.concatenate([arm_velocity_style_action, gripper_closedness], axis=-1).astype(np.float32)
 +
 +
-+def axis_downsampled_frame_indices(episode_ends: np.ndarray, downsample_ratio: int) -> np.ndarray:
++def axis_downsampled_frame_indices(
++    episode_ends: np.ndarray, downsample_ratio: int, action_horizon: int = 1
++) -> np.ndarray:
 +    ratio = int(downsample_ratio)
-+    if ratio < 1:
-+        raise ValueError(f"downsample_ratio must be >= 1, got {downsample_ratio}")
++    horizon = int(action_horizon)
++    if ratio < 1 or horizon < 1:
++        raise ValueError(
++            f"downsample_ratio and action_horizon must be >= 1, got {downsample_ratio} and {action_horizon}"
++        )
 +
 +    ends = np.asarray(episode_ends, dtype=np.int64)
 +    if ends.ndim != 1 or len(ends) == 0:
@@ -742,11 +854,12 @@ index e2ee7dd..bfb938d 100644
 +
 +    selected: list[np.ndarray] = []
 +    episode_start = 0
-+    for episode_end in ends:
-+        episode_end = int(episode_end)
++    for raw_episode_end in ends:
++        episode_end = int(raw_episode_end)
 +        if episode_end <= episode_start:
 +            raise ValueError(f"episode_ends must be strictly increasing, got {ends}")
-+        selected.append(np.arange(episode_start, episode_end, ratio, dtype=np.int64))
++        stop = max(episode_start, episode_end - (horizon - 1) * ratio - 1)
++        selected.append(np.arange(episode_start, stop, ratio, dtype=np.int64))
 +        episode_start = episode_end
 +
 +    return np.concatenate(selected) if selected else np.empty((0,), dtype=np.int64)
@@ -755,7 +868,7 @@ index e2ee7dd..bfb938d 100644
  def create_torch_dataset(
      data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
  ) -> Dataset:
-@@ -136,6 +589,16 @@ def create_torch_dataset(
+@@ -136,6 +590,16 @@ def create_torch_dataset(
          raise ValueError("Repo ID is not set. Cannot create dataset.")
      if repo_id == "fake":
          return FakeDataset(model_config, num_samples=1024)
@@ -772,3 +885,115 @@ index e2ee7dd..bfb938d 100644
  
      dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
      dataset = lerobot_dataset.LeRobotDataset(
+diff --git a/src/openpi/policies/policy_config.py b/src/openpi/policies/policy_config.py
+index 6570df0..26817aa 100644
+--- a/src/openpi/policies/policy_config.py
++++ b/src/openpi/policies/policy_config.py
+@@ -42,5 +42,4 @@ def create_trained_policy(
+         The function automatically detects whether the model is PyTorch-based by checking for the
+         presence of "model.safensors" in the checkpoint directory.
+     """
+-    repack_transforms = repack_transforms or transforms.Group()
+     checkpoint_dir = download.maybe_download(str(checkpoint_dir))
+@@ -56,6 +55,8 @@ def create_trained_policy(
+     else:
+         model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
+     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
++    if repack_transforms is None:
++        repack_transforms = data_config.policy_repack_transforms
+     if norm_stats is None:
+         # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure
+         # that the policy is using the same normalization stats as the original training process.
+diff --git a/src/openpi/training/axis_data_loader_test.py b/src/openpi/training/axis_data_loader_test.py
+new file mode 100644
+index 0000000..2535400
+--- /dev/null
++++ b/src/openpi/training/axis_data_loader_test.py
+@@ -0,0 +1,87 @@
++import flax.nnx as nnx
++import jax
++import numpy as np
++
++from openpi.training import config as _config
++from openpi.training import data_loader as _data_loader
++import openpi.transforms as _transforms
++
++
++def test_axis_downsampled_frame_indices_exclude_terminal_padding_horizon():
++    indices = _data_loader.axis_downsampled_frame_indices(
++        np.asarray([40, 80], dtype=np.int64),
++        downsample_ratio=2,
++        action_horizon=15,
++    )
++
++    np.testing.assert_array_equal(indices, np.asarray([0, 2, 4, 6, 8, 10, 40, 42, 44, 46, 48, 50]))
++
++
++def test_axis_downsampled_frame_indices_exclude_terminal_row_for_single_action():
++    indices = _data_loader.axis_downsampled_frame_indices(
++        np.asarray([5], dtype=np.int64),
++        downsample_ratio=1,
++        action_horizon=1,
++    )
++
++    np.testing.assert_array_equal(indices, np.asarray([0, 1, 2, 3]))
++
++
++def test_axis_clean_task_discovery_preserves_simulator_provenance(tmp_path, monkeypatch):
++    mujoco_task = tmp_path / "task_0001_mujoco_state_train"
++    isaac_task = tmp_path / "task_0002_isaac_state_train"
++    mujoco_task.mkdir()
++    isaac_task.mkdir()
++    monkeypatch.delenv("OPENPI_AXIS_CLEAN_TASK_IDS", raising=False)
++    monkeypatch.delenv("OPENPI_AXIS_CLEAN_MAX_TASKS", raising=False)
++
++    assert _data_loader._axis_clean_selected_task_dirs(tmp_path) == [mujoco_task, isaac_task]  # noqa: SLF001
++
++
++def test_axis_train_config_reads_the_norm_stats_path_written_by_compute_stats():
++    config = _config.get_config("pi05_axis_clean_local_droid_lora")
++
++    assert config.data.repo_id == "local/axis_clean"
++    assert config.data.assets.asset_id == config.data.repo_id
++    assert config.data.assets.assets_dir is None
++
++
++def test_axis_action_expert_config_trains_only_expert_and_projections():
++    config = _config.get_config("pi05_axis_clean_local_droid_action_expert")
++    model = nnx.eval_shape(config.model.create, jax.random.key(0))
++    params = nnx.state(model, nnx.Param)
++    trainable = params.filter(config.trainable_filter).flat_state()
++
++    paths = ["/".join(str(part) for part in path) for path in trainable]
++    trainable_count = sum(int(np.prod(value.value.shape)) for value in trainable.values())
++
++    assert trainable_count == 430_098_464
++    assert all(not path.startswith("PaliGemma/img/") for path in paths)
++    assert all(not path.startswith("PaliGemma/llm/") or "_1" in path for path in paths)
++    assert any(path.startswith("PaliGemma/llm/") and "_1" in path for path in paths)
++    assert any(path.startswith("action_out_proj/") for path in paths)
++
++
++def test_axis_clean_policy_repack_does_not_require_ground_truth_actions(tmp_path, monkeypatch):
++    monkeypatch.setenv("AXIS_CLEAN_ROOT", str(tmp_path))
++    config = _config.get_config("pi05_axis_clean_local_droid_lora")
++    data_config = config.data.create(config.assets_dirs, config.model)
++    transform = _transforms.compose(data_config.policy_repack_transforms.inputs)
++
++    repacked = transform(
++        {
++            "observation.exterior_image_1_left": np.zeros((8, 8, 3), dtype=np.uint8),
++            "observation.wrist_image_left": np.zeros((8, 8, 3), dtype=np.uint8),
++            "observation.joint_position": np.zeros(7, dtype=np.float32),
++            "observation.gripper_position": np.zeros(1, dtype=np.float32),
++            "prompt": "test prompt",
++        }
++    )
++
++    assert set(repacked) == {
++        "observation/exterior_image_1_left",
++        "observation/wrist_image_left",
++        "observation/joint_position",
++        "observation/gripper_position",
++        "prompt",
++    }

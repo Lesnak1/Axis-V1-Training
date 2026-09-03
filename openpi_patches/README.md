@@ -11,10 +11,15 @@ It adds only release-scoped AXIS training support:
 - `LeRobotAxisCleanDroidDataConfig`
 - local AXIS-format LeRobot loader
 - 9D AXIS qpos to 8D DROID-style online adaptation
+- lossless arm-velocity conversion without an internal `[-1, 1]` clip
 - norm-stat support for the local AXIS loader
+- a separate inference-only repack transform, so live observations never need
+  a ground-truth `actions` key
 - `pi05_axis_clean_local_droid_lora`
 - `pi05_axis_clean_local_droid_full`
+- `pi05_axis_clean_local_droid_action_expert`
 - `pi05_libero_lora`
+- focused AXIS loader, horizon, assets-path, and policy-repack tests
 
 Apply from inside an OpenPI checkout:
 
